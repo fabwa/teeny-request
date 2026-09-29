@@ -17,13 +17,72 @@
 
 import {Agent as HTTPAgent} from 'http';
 import {Agent as HTTPSAgent} from 'https';
-// eslint-disable-next-line n/no-deprecated-api
-import {parse} from 'url';
 import {Options} from './';
 
 export const pool = new Map<string, HTTPAgent>();
 
 export type HttpAnyAgent = HTTPAgent | HTTPSAgent;
+
+/**
+ * The subset of `pool` options that is safe to hand to a cached agent.
+ *
+ * `pool` is given per request, but the agent built from it is shared by every
+ * later request in the process. Anything that decides where a connection goes
+ * or how the peer is verified (host, port, ca, cert, key, rejectUnauthorized,
+ * checkServerIdentity, servername, createConnection, ...) therefore has to be
+ * dropped here, otherwise a single request can downgrade or redirect the
+ * traffic of unrelated requests.
+ */
+const SAFE_POOL_OPTIONS = [
+  'keepAlive',
+  'keepAliveMsecs',
+  'maxSockets',
+  'maxFreeSockets',
+  'maxTotalSockets',
+  'scheduling',
+  'timeout',
+];
+
+function safePoolOptions(reqOpts: Options) {
+  const requested = reqOpts.pool as {[key: string]: unknown} | undefined;
+  const safe: {[key: string]: unknown} = {};
+  if (!requested) {
+    return safe;
+  }
+  for (const key of SAFE_POOL_OPTIONS) {
+    if (requested[key] !== undefined) {
+      safe[key] = requested[key];
+    }
+  }
+  return safe;
+}
+
+// Pool entries are kept per target, so a request to one host can never hand its
+// agent to a request for another host.
+function poolKey(uri: string): string {
+  try {
+    return new URL(uri).host;
+  } catch (err) {
+    return 'unknown';
+  }
+}
+
+// Same shape as the old url.parse() call, without the deprecation warning.
+// Proxies without a scheme (`host:8080`) are common in env vars, so those are
+// read as http proxies.
+function parseProxy(proxy: string) {
+  const url = new URL(proxy.includes('://') ? proxy : `http://${proxy}`);
+  return {
+    protocol: url.protocol,
+    hostname: url.hostname,
+    host: url.host,
+    port: url.port ? Number(url.port) : null,
+    path: `${url.pathname}${url.search}`,
+    auth: url.username
+      ? `${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`
+      : null,
+  };
+}
 
 /**
  * Determines if a proxy should be considered based on the environment.
@@ -76,7 +135,7 @@ export function getAgent(
     process.env.HTTPS_PROXY ||
     process.env.https_proxy;
 
-  const poolOptions = Object.assign({}, reqOpts.pool);
+  const poolOptions = safePoolOptions(reqOpts);
 
   const manuallyProvidedProxy = !!reqOpts.proxy;
   const shouldUseProxy = manuallyProvidedProxy || shouldUseProxyForURI(uri);
@@ -87,14 +146,14 @@ export function getAgent(
       ? require('http-proxy-agent')
       : require('https-proxy-agent');
 
-    const proxyOpts = {...parse(proxy), ...poolOptions};
+    const proxyOpts = {...parseProxy(proxy), ...poolOptions};
     return new Agent(proxyOpts);
   }
 
   let key = isHttp ? 'http' : 'https';
 
   if (reqOpts.forever) {
-    key += ':forever';
+    key += `:forever:${poolKey(uri)}`;
 
     if (!pool.has(key)) {
       // tslint:disable-next-line variable-name
